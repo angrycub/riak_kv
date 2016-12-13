@@ -331,33 +331,95 @@ delete(Bucket, PrimaryKey, IndexSpecs, #state{ref=Ref,
             {error, Reason, State}
     end.
 
+%%%% @doc Fold over all the buckets
+%%-spec fold_buckets(riak_kv_backend:fold_buckets_fun(),
+%%                   any(),
+%%                   [],
+%%                   state()) -> {ok, any()} | {async, fun()}.
+%%fold_buckets(FoldBucketsFun, Acc, Opts, #state{fold_opts=FoldOpts,
+%%                                               ref=Ref}) ->
+%%    FoldFun = fold_buckets_fun(FoldBucketsFun),
+%%    FirstKey = to_first_key(undefined),
+%%    FoldOpts1 = [{first_key, FirstKey} | FoldOpts],
+%%    BucketFolder =
+%%        fun() ->
+%%                try
+%%                    {FoldResult, _} =
+%%                        eleveldb:fold_keys(Ref, FoldFun, {Acc, []}, FoldOpts1),
+%%                    FoldResult
+%%                catch
+%%                    {break, AccFinal} ->
+%%                        AccFinal
+%%                end
+%%        end,
+%%    case lists:member(async_fold, Opts) of
+%%        true ->
+%%            {async, BucketFolder};
+%%        false ->
+%%            {ok, BucketFolder()}
+%%    end.
+
 %% @doc Fold over all the buckets
 -spec fold_buckets(riak_kv_backend:fold_buckets_fun(),
                    any(),
                    [],
                    state()) -> {ok, any()} | {async, fun()}.
-fold_buckets(FoldBucketsFun, Acc, Opts, #state{fold_opts=FoldOpts,
-                                               ref=Ref}) ->
-    FoldFun = fold_buckets_fun(FoldBucketsFun),
-    FirstKey = to_first_key(undefined),
-    FoldOpts1 = [{first_key, FirstKey} | FoldOpts],
-    BucketFolder =
-        fun() ->
-                try
-                    {FoldResult, _} =
-                        eleveldb:fold_keys(Ref, FoldFun, {Acc, []}, FoldOpts1),
-                    FoldResult
-                catch
-                    {break, AccFinal} ->
-                        AccFinal
-                end
-        end,
-    case lists:member(async_fold, Opts) of
+%% TODO: What fold opts are really supported here?
+fold_buckets(FoldBucketsFun, Acc, Opts, #state{fold_opts=_FoldOpts,
+                                               ref=DbRef}) ->
+    {ok, Itr} = eleveldb:iterator(DbRef, Opts, keys_only),
+    Async = proplists:get_bool(async_fold, Opts),
+    BucketFolder = bucket_folder_fun(Itr, FoldBucketsFun, Acc),
+
+    case Async of
         true ->
             {async, BucketFolder};
         false ->
             {ok, BucketFolder()}
     end.
+
+bucket_folder_fun(Itr, FoldBucketsFun, Acc) ->
+    fun() ->
+        try
+            fold_list_buckets(undefined, Itr, FoldBucketsFun, Acc)
+        after
+            eleveldb:iterator_close(Itr)
+        end
+    end.
+
+fold_list_buckets(PrevBucket, Itr, FoldBucketsFun, Acc) ->
+    lager:debug("fold_list_buckets prev=~p~n", [PrevBucket]),
+    Seek = determine_next_bucket_seek(PrevBucket),
+    _Opts = [], %% For object listing, use iterator_prefetch option
+    case eleveldb:iterator_move(Itr, Seek) of
+        {error, invalid_iterator} ->
+            lager:debug( "DBG: NO_MORE_BUCKETS~n", []),
+            Acc;
+        {ok, BK} ->
+            {Bucket, NewAcc} = case from_object_key(BK) of
+                {PrevBucket, _} ->
+                    throw({error, did_not_skip_to_next_bucket});
+                {NewBucket, _} ->
+                    lager:debug( "DBG: NEXT_BUCKET ~p~n", [NewBucket]),
+                    {NewBucket, FoldBucketsFun(NewBucket, Acc)};
+                ignore ->
+                    {PrevBucket, Acc};
+                Other ->
+                    lager:info("DBG: Got other result: ~p", [Other]),
+                    throw({break, Acc, Other, BK}) %% TODO: Remove "Other" from this!!!
+            end,
+            fold_list_buckets(Bucket, Itr, FoldBucketsFun, NewAcc)
+    end.
+
+
+determine_next_bucket_seek(PrevBucket) ->
+    case PrevBucket of
+         undefined ->
+             to_first_key(undefined);
+         _ ->
+             to_next_bucket_key(PrevBucket)
+     end.
+
 
 %% @doc Fold over all the keys for one or all buckets.
 -spec fold_keys(riak_kv_backend:fold_keys_fun(),
@@ -657,21 +719,21 @@ config_value(Key, Config, Default) ->
             Value
     end.
 
-%% @private
-%% Return a function to fold over the buckets on this backend
-fold_buckets_fun(FoldBucketsFun) ->
-    fun(BK, {Acc, LastBucket}) ->
-            case from_object_key(BK) of
-                {LastBucket, _} ->
-                    {Acc, LastBucket};
-                {Bucket, _} ->
-                    {FoldBucketsFun(Bucket, Acc), Bucket};
-                ignore ->
-                    {Acc, LastBucket};
-                _ ->
-                    throw({break, Acc})
-            end
-    end.
+%%%% @private
+%%%% Return a function to fold over the buckets on this backend
+%%fold_buckets_fun(FoldBucketsFun) ->
+%%    fun(BK, {Acc, LastBucket}) ->
+%%            case from_object_key(BK) of
+%%                {LastBucket, _} ->
+%%                    {Acc, LastBucket};
+%%                {Bucket, _} ->
+%%                    {FoldBucketsFun(Bucket, Acc), Bucket};
+%%                ignore ->
+%%                    {Acc, LastBucket};
+%%                _ ->
+%%                    throw({break, Acc})
+%%            end
+%%    end.
 
 %% @private
 %% Return a function to fold over keys on this backend
@@ -877,6 +939,11 @@ to_legacy_first_key({index, Bucket, {range, Field, StartTerm, _EndTerm}}) ->
     to_legacy_index_key(Bucket, <<>>, Field, StartTerm);
 to_legacy_first_key(Other) ->
     to_first_key(Other).
+
+to_next_bucket_key({BucketType, Bucket}=_Bucket) ->
+    to_object_key({BucketType, <<Bucket/binary, 0>>}, <<>>);
+to_next_bucket_key(Bucket) ->
+    to_object_key(<<Bucket/binary, 0>>, <<>>).
 
 to_object_key(Bucket, Key) ->
     sext:encode({o, Bucket, Key}).
