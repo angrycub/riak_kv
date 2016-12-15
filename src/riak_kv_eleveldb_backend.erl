@@ -406,11 +406,7 @@ maybe_accumulate_bucket({NewBucket, _}, _PrevBucket, FoldBucketsFun, Acc, _Seek,
         fold_list_buckets(NewBucket, Itr, FoldBucketsFun, NewAcc)
     catch Error ->
         {error, Error}
-    end;
-
-maybe_accumulate_bucket(Other, _PrevBucket, _FoldBucketsFun, Acc, Seek, _Itr) ->
-    lager:info("DBG: Got other result: ~p", [Other]),
-    {break, {Acc, Other, Seek}}. %% TODO: Remove "Other" from this!!!
+    end.
 
 determine_next_bucket_seek(PrevBucket) ->
     case PrevBucket of
