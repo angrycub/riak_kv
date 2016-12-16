@@ -337,10 +337,10 @@ delete(Bucket, PrimaryKey, IndexSpecs, #state{ref=Ref,
                    [],
                    state()) -> {ok, any()} | {async, fun()}.
 %% TODO: What fold opts are really supported here?
-fold_buckets(FoldBucketsFun, Acc, Opts, #state{fold_opts=_FoldOpts,
+fold_buckets(FoldBucketsFun, Acc, Opts, #state{fold_opts=FoldOpts,
                                                ref=DbRef}) ->
     Async = proplists:get_bool(async_fold, Opts),
-    BucketFolder = bucket_folder_fun(DbRef, Opts, FoldBucketsFun, Acc),
+    BucketFolder = bucket_folder_fun(DbRef, FoldOpts, FoldBucketsFun, Acc),
 
     case Async of
         true ->
@@ -351,7 +351,7 @@ fold_buckets(FoldBucketsFun, Acc, Opts, #state{fold_opts=_FoldOpts,
 
 %%%% @private
 %%%% Return a function to fold over the buckets on this backend
-%% NOTE: There are some careful useages of `try...of` here
+%% NOTE: There are some careful usages of `try...of` here
 %% because try...catch constructs can prevent tail call optimizations
 %% and make us run out of stack space on large folds.
 %% Work hard in this and other functions called in the code path
