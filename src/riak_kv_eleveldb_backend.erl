@@ -351,6 +351,12 @@ fold_buckets(FoldBucketsFun, Acc, Opts, #state{fold_opts=_FoldOpts,
 
 %%%% @private
 %%%% Return a function to fold over the buckets on this backend
+%% NOTE: There are some careful useages of `try...of` here
+%% because try...catch constructs can prevent tail call optimizations
+%% and make us run out of stack space on large folds.
+%% Work hard in this and other functions called in the code path
+%% to always return errors, rather than depending on an outer
+%% try...catch to handle issues.
 bucket_folder_fun(DbRef, Opts, FoldBucketsFun, Acc) ->
     fun() ->
         try eleveldb:iterator(DbRef, Opts, keys_only) of
