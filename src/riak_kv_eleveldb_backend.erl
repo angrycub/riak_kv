@@ -422,13 +422,26 @@ determine_next_bucket_seek(PrevBucket) ->
              to_next_bucket_key(PrevBucket)
      end.
 
+-record(
+group_params, {
+    prefix :: string(),
+    delimiter :: string(),
+    start_after :: string(),
+    max_keys :: pos_integer()
+}
+).
+
+
+-spec fold_keys(riak_kv_backend:fold_keys_fun(),
+    any(),
+    [{atom(), term()}],
+    state()) -> {ok, term()} | {async, fun()}.
+fold_keys(FoldKeysFun, Acc, Opts, State) ->
+    FoldKeysType = proplists:get_value(fold_keys_type, Opts, fold_keys),
+    fold_keys(FoldKeysType, FoldKeysFun, Acc, Opts, State).
 
 %% @doc Fold over all the keys for one or all buckets.
--spec fold_keys(riak_kv_backend:fold_keys_fun(),
-                any(),
-                [{atom(), term()}],
-                state()) -> {ok, term()} | {async, fun()}.
-fold_keys(FoldKeysFun, Acc, Opts, #state{fold_opts=FoldOpts,
+fold_keys(fold_keys, FoldKeysFun, Acc, Opts, #state{fold_opts=FoldOpts,
                                          fixed_indexes=FixedIdx,
                                          legacy_indexes=WriteLegacyIdx,
                                          ref=Ref}) ->
@@ -471,6 +484,152 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{fold_opts=FoldOpts,
             {async, KeyFolder};
         false ->
             {ok, KeyFolder()}
+    end;
+fold_keys(fold_groupkeys,
+    FoldContentsFun, Acc, Opts,
+    #state{fold_opts=FoldOpts, ref=DbRef}
+) ->
+    Bucket = proplists:get_value(bucket, Opts),
+    GroupParams = to_group_params(proplists:get_value(group_params, Opts, [])),
+    ContentFolderFun = content_folder_fun(Bucket, GroupParams, DbRef, FoldOpts, FoldContentsFun, Acc),
+    Async = proplists:get_bool(async_fold, Opts),
+    case Async of
+        true ->
+            {async, ContentFolderFun};
+        false ->
+            {ok, ContentFolderFun()}
+    end.
+
+to_group_params(PropList) ->
+    #group_params{
+        prefix=proplists:get_value(prefix, PropList),
+        delimiter=proplists:get_value(delimiter, PropList),
+        start_after=proplists:get_value(start_after, PropList),
+        max_keys=proplists:get_value(max_keys, PropList)
+    }.
+
+content_folder_fun(Bucket, GroupParams, DbRef, FoldOpts, FoldContentsFun, Acc) ->
+    fun() ->
+        FoldOpts1 = [{first_key, to_first_key({bucket, Bucket})} | FoldOpts],
+        try eleveldb:iterator(DbRef, FoldOpts1) of
+            {ok, Itr} ->
+                iterate_contents(Bucket, GroupParams, Itr, FoldContentsFun, Acc)
+        catch Error ->
+            lager:debug("Could not open eleveldb iterator: ~p", [Error]),
+            throw(Error)
+        end
+    end.
+
+iterate_contents(Bucket, GroupParams, Itr, FoldContentsFun, Acc) ->
+    Outcome = enumerate_contents(undefined, Bucket, GroupParams, Itr, FoldContentsFun, Acc),
+    eleveldb:iterator_close(Itr),
+    case Outcome of
+        {error, _Err} = Error ->
+            throw(Error);
+        {break, _Res} = Result ->
+            throw(Result);
+        Result -> Result
+    end.
+
+enumerate_contents(PrevEntry, Bucket, GroupParams, Itr, FoldContentsFun, Acc) ->
+    Pos = next_pos(PrevEntry, Bucket, GroupParams),
+    case Pos of
+        npos ->
+            Acc;
+        _ ->
+            try eleveldb:iterator_move(Itr, Pos) of
+                {error, invalid_iterator} ->
+                    lager:debug( "invalid_iterator.  reached end.", []),
+                    Acc;
+                {error, iterator_closed} ->
+                    lager:debug( "iterator_closed.", []),
+                    Acc;
+                {ok, BinaryBKey, BinaryValue} ->
+                    BKey = from_object_key(BinaryBKey),
+                    maybe_accumulate_contents({BKey, BinaryValue}, PrevEntry, Bucket, GroupParams, FoldContentsFun, Acc, Itr)
+            catch Error ->
+                {error, {eleveldb_error, Error}}
+            end
+    end.
+
+
+next_pos(undefined, Bucket, GroupParams) ->
+    start_pos(Bucket, GroupParams);
+next_pos(_PrevBKey, _Bucket, #group_params{prefix=undefined}) ->
+    next;
+next_pos({_Bucket, PrevKey} = _PrevBKey, _Bucket, #group_params{prefix=Prefix}) ->
+    case is_prefix(Prefix, PrevKey) of
+        true ->
+            next;
+        _ ->
+            npos
+    end.
+
+is_prefix(B1, B2) ->
+    binary:longest_common_prefix([B1, B2]) == size(B1).
+
+start_pos(Bucket, #group_params{prefix=undefined, start_after=undefined}) ->
+    to_object_key(Bucket, <<"">>);
+start_pos(Bucket, #group_params{prefix=Prefix, start_after=undefined}) ->
+    to_object_key(Bucket, Prefix);
+start_pos(Bucket, #group_params{prefix=undefined, start_after=StartAfter}) ->
+    to_object_key(Bucket, <<StartAfter/binary, 0>>);
+start_pos(Bucket, #group_params{prefix=Prefix, start_after=StartAfter}) ->
+    case StartAfter =< Prefix of
+        true ->
+            to_object_key(Bucket, Prefix);
+        _ ->
+            npos
+    end.
+
+maybe_accumulate_contents({undefined, _BinaryValue}, _PrevEntry, _Bucket, _GroupParams, _FoldContentsFun, Acc, _Itr) ->
+    Acc;
+maybe_accumulate_contents({ignore, _BinaryValue}, _PrevEntry, _Bucket, _GroupParams, _FoldContentsFun, Acc, _Itr) ->
+    lager:error("Encountered corrupt key while iterating entries. Grouped key list may be incomplete."),
+    Acc;
+maybe_accumulate_contents(PrevEntry, PrevEntry, _Bucket, _GroupParams, _FoldKeysFun, _Acc, _Itr) ->
+    {error, did_not_skip_to_next_entry};
+maybe_accumulate_contents(Entry, _PrevEntry, Bucket, #group_params{prefix=undefined}=GroupParams, FoldContentsFun, Acc, Itr) ->
+    accumulate_contents(Entry, Bucket, GroupParams, FoldContentsFun, Acc, Itr);
+maybe_accumulate_contents({{Bucket, Key}=_BKey, _BinaryValue} = Entry, _PrevEntry, Bucket, #group_params{prefix=Prefix}=GroupParams, FoldContentsFun, Acc, Itr) ->
+    case Prefix =/= undefined andalso is_prefix(Prefix, Key) of
+        true ->
+            accumulate_contents(Entry, Bucket, GroupParams, FoldContentsFun, Acc, Itr);
+        false ->
+            % done
+            Acc
+    end.
+
+accumulate_contents({{Bucket, Key}=BKey, BinaryValue}, Bucket, GroupParams, FoldContentsFun, Acc, Itr) ->
+    NewAcc = try
+        Contents = get_contents(BKey, BinaryValue),
+        FoldContentsFun(Bucket, Key, Contents, Acc)
+    catch Error ->
+        FoldContentsFun(Bucket, Key, {error, Error}, Acc)
+    end,
+    enumerate_contents(BKey, Bucket, GroupParams, Itr, FoldContentsFun, NewAcc).
+
+get_contents({Bucket, Key} = _BKey, BinaryValue) ->
+    RObj = riak_object:from_binary(Bucket, Key, BinaryValue),
+    Contents = riak_object:get_contents(RObj),
+    case Contents of
+        [_Content] ->
+            Value = riak_object:get_value(RObj),
+            Size = riak_object:value_size(Value),
+            Hash = riak_object:hash(RObj),
+            Metadata = riak_object:get_metadata(RObj),
+            Timestamp = case dict:find(<<"X-Riak-Last-Modified">>, Metadata) of
+                {ok, TS} -> TS;
+                _ -> undefined
+            end,
+            {contents, [
+                {size, Size},
+                {hash, Hash},
+                {last_modified, Timestamp}
+            ]};
+        _ ->
+            %% TODO
+            {error, riak_object_has_siblings}
     end.
 
 fold_indexes(FoldIndexFun, Acc, _Opts, #state{fold_opts=FoldOpts,
